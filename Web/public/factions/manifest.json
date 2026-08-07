@@ -1,0 +1,26 @@
+{
+  "blackDog": {
+    "name": "Black Dog",
+    "prefix": "bv",
+    "logoUrl": "/factions/black-dog.svg",
+    "sourceUrl": "https://drive.google.com/file/d/18BR_5bKdT0w9uVPbhlVYvtqc-rvHWqd-/view"
+  },
+  "cca": {
+    "name": "CCA",
+    "prefix": "sv",
+    "logoUrl": "/factions/cca.svg",
+    "sourceUrl": "https://drive.google.com/file/d/1pNEXq1wXUnN5eV4GkpQgBwXXeyrll6Kr/view"
+  },
+  "nsdf": {
+    "name": "NSDF",
+    "prefix": "av",
+    "logoUrl": "/factions/nsdf.svg",
+    "sourceUrl": "https://drive.google.com/file/d/1XHHD9jHNMkZDkir606R_Zd3r5xPSehGQ/view"
+  },
+  "cra": {
+    "name": "CRA",
+    "prefix": "cv",
+    "logoUrl": "/factions/cra.svg",
+    "sourceUrl": "https://drive.google.com/file/d/1hote8N2Ix3NiczEHqR6VkJcFZi3NC1yi/view"
+  }
+}

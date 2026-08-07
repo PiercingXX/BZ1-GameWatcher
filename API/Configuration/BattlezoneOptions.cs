@@ -25,14 +25,16 @@ namespace BZAPI.Configuration
         public TimeSpan ErrorReconnectTimeout { get; set; } = TimeSpan.FromSeconds(10);
 
         /// <summary>
-        /// Users connecting from these addresses are service accounts and are hidden from the
-        /// public lobby list.
+        /// Optional addresses whose users should be omitted from the visible lobby member list.
+        /// Empty by default: third-party bridge/service accounts are treated like any other user.
+        /// Network addresses themselves are still excluded from the public API response model.
         /// </summary>
-        public string[] HiddenUserIpAddresses { get; set; } = ["::ffff:54.200.83.68"];
+        public string[] HiddenUserIpAddresses { get; set; } = [];
 
         /// <summary>
-        /// Steam IDs flagged with <see cref="Models.BZ98User.IsDangerous"/>. Empty by default.
+        /// Steam IDs flagged with <see cref="Models.BZ98User.IsDangerous"/>. The default mirrors
+        /// the known-user warning maintained by the Battlezone Lobby Monitor project.
         /// </summary>
-        public ulong[] FlaggedSteamIds { get; set; } = [];
+        public ulong[] FlaggedSteamIds { get; set; } = [76561198297657246UL];
     }
 }

@@ -1,6 +1,8 @@
 using System.Threading.Channels;
+using BZAPI.Bot;
 using BZAPI.Configuration;
 using BZAPI.Models;
+using BZAPI.Protocol;
 using BZAPI.Steam;
 using BZAPI.Storage;
 using Microsoft.Extensions.Options;
@@ -15,11 +17,12 @@ namespace BZAPI.Websocket
     /// </summary>
     public sealed class BZ98LobbyWatcher : BackgroundService
     {
-        private const string ModNameSeparator = "~~";
-
         private readonly ILobbyStore _store;
+        private readonly IChatStore _chat;
         private readonly ISteamAvatarProvider _avatars;
         private readonly BattlezoneOptions _options;
+        private readonly LobbyBotCoordinator _bot;
+        private readonly LobbyConnectionState _connectionState;
         private readonly ILogger<BZ98LobbyWatcher> _logger;
 
         /// <summary>
@@ -33,13 +36,19 @@ namespace BZAPI.Websocket
 
         public BZ98LobbyWatcher(
             ILobbyStore store,
+            IChatStore chat,
             ISteamAvatarProvider avatars,
             IOptions<BattlezoneOptions> options,
+            LobbyBotCoordinator bot,
+            LobbyConnectionState connectionState,
             ILogger<BZ98LobbyWatcher> logger)
         {
             _store = store;
+            _chat = chat;
             _avatars = avatars;
             _options = options.Value;
+            _bot = bot;
+            _connectionState = connectionState;
             _logger = logger;
         }
 
@@ -61,28 +70,37 @@ namespace BZAPI.Websocket
             // data until it was restarted.
             using var reconnections = client.ReconnectionHappened.Subscribe(info =>
             {
+                _connectionState.MarkConnected();
                 _logger.LogInformation("Websocket connected ({ReconnectionType}); authorising.", info.Type);
+                _bot.OnSocketConnected();
                 SendAuthorization(client);
             });
 
             using var disconnections = client.DisconnectionHappened.Subscribe(info =>
+            {
+                _connectionState.MarkDisconnected();
+                _bot.OnSocketDisconnected();
                 _logger.LogWarning(
                     info.Exception,
                     "Websocket disconnected ({DisconnectionType}, close status {CloseStatus}).",
                     info.Type,
-                    info.CloseStatus));
+                    info.CloseStatus);
+            });
 
             using var subscription = client.MessageReceived.Subscribe(message =>
             {
                 if (message.Text is { Length: > 0 } text)
                 {
+                    _connectionState.MarkMessage();
                     _messages.Writer.TryWrite(text);
                 }
             });
 
             await client.Start();
 
-            await ProcessMessagesAsync(client, stoppingToken);
+            await Task.WhenAll(
+                ProcessMessagesAsync(client, stoppingToken),
+                _bot.RunAsync(client, stoppingToken));
         }
 
         private async Task ProcessMessagesAsync(IWebsocketClient client, CancellationToken stoppingToken)
@@ -127,11 +145,15 @@ namespace BZAPI.Websocket
             {
                 case nameof(WebsocketMessageType.OnAuthorization):
                     EnterLounge(client);
+                    _bot.OnAuthorized(client, text);
                     break;
 
                 case nameof(WebsocketMessageType.OnLobbyListChanged):
+                case "OnLobbyList":
+                case "OnGetLobbyList":
                 case nameof(WebsocketMessageType.OnLobbyChanged):
-                    await HandleLobbyUpdateAsync(envelope.Type, text, cancellationToken);
+                case "OnLobbyUpdate":
+                    await HandleLobbyUpdateAsync(client, envelope.Type, text, cancellationToken);
                     break;
 
                 case nameof(WebsocketMessageType.OnLobbyRemoved):
@@ -140,15 +162,36 @@ namespace BZAPI.Websocket
                     if (removal?.Data is not null)
                     {
                         _store.Remove(removal.Data.Id);
+                        _chat.RemoveLobby(removal.Data.Id);
                     }
 
+                    _bot.OnLobbyRemoved(text);
+                    break;
+
+                case "OnLobbyJoined":
+                    _bot.OnLobbyJoined(text);
+                    break;
+
+                case "OnLobbyCreated":
+                    _bot.OnLobbyCreated(client, text);
+                    break;
+
+                case "OnLobbyMemberListChanged":
+                    _bot.OnMemberListChanged(client, text);
                     break;
             }
         }
 
-        private async Task HandleLobbyUpdateAsync(string messageType, string text, CancellationToken cancellationToken)
+        private async Task HandleLobbyUpdateAsync(
+            IWebsocketClient client,
+            string messageType,
+            string text,
+            CancellationToken cancellationToken)
         {
-            var isFullList = messageType == nameof(WebsocketMessageType.OnLobbyListChanged);
+            var isFullList = messageType is
+                nameof(WebsocketMessageType.OnLobbyListChanged) or
+                "OnLobbyList" or
+                "OnGetLobbyList";
 
             var message = JsonConvert.DeserializeObject<WebsocketLobbyMessage>(text);
             var lobbies = message?.Data?.BZ98Lobbies?.Values.Where(lobby => lobby is not null).ToList();
@@ -159,6 +202,7 @@ namespace BZAPI.Websocket
                 if (isFullList)
                 {
                     _store.Replace([]);
+                    _bot.OnLobbySnapshot(client, [], true);
                 }
 
                 return;
@@ -170,6 +214,8 @@ namespace BZAPI.Websocket
             {
                 await PopulateLobbyAsync(lobby, cancellationToken);
             }
+
+            _bot.OnLobbySnapshot(client, lobbies, isFullList);
 
             if (isFullList)
             {
@@ -185,71 +231,54 @@ namespace BZAPI.Websocket
 
         private async Task PopulateLobbyAsync(BZ98Lobby lobby, CancellationToken cancellationToken)
         {
-            if (lobby.MetaData is not null)
-            {
-                lobby.MetaData.Name = StripModPrefix(lobby.MetaData.Name);
-            }
+            // Keep reverse-engineered protocol semantics in the pure parser so the live watcher and
+            // sanitized regression fixtures exercise the same production normalization path.
+            BZ98ProtocolParser.NormalizeLobby(lobby);
 
-            if (lobby.Users is null || lobby.Users.Count == 0)
+            var users = lobby.Users;
+            if (users is null || users.Count == 0)
             {
                 return;
             }
 
-            foreach (var key in lobby.Users.Keys.ToList())
+            // The owner snapshot above must happen before this filter. The observer is a real Web
+            // user upstream, but Game Watcher's own identity should not inflate public activity.
+            BZ98ProtocolParser.FilterPublicUsers(
+                lobby,
+                (key, user) =>
+                    _chat.IsObserverUser(lobby.Id, user.Id ?? key) ||
+                    (user.IPAddress is not null && _options.HiddenUserIpAddresses.Contains(user.IPAddress)));
+
+            if (users.Count == 0)
             {
-                if (!lobby.Users.TryGetValue(key, out var user) || user is null)
+                return;
+            }
+
+            foreach (var pair in users)
+            {
+                var key = pair.Key;
+                var user = pair.Value;
+                if (user is null || !user.IsSteam)
                 {
-                    lobby.Users.Remove(key);
                     continue;
                 }
 
-                // Service accounts sit in the lounge permanently; hide them from the public list.
-                if (user.IPAddress is not null && _options.HiddenUserIpAddresses.Contains(user.IPAddress))
+                // authType has already been normalized by BZ98ProtocolParser. Steam-ID-shaped
+                // identifiers are used only for Steam enrichment when authType actually is steam.
+                var steamKey = user.Id ?? key;
+                if (steamKey.Length > 1 && steamKey[0] == 'S' && ulong.TryParse(steamKey[1..], out var steamId))
                 {
-                    lobby.Users.Remove(key);
-                    continue;
-                }
-
-                if (key.Length == 0 || key[0] != 'S')
-                {
-                    user.IsGOG = true;
-                }
-                else if (ulong.TryParse(key[1..], out var steamId))
-                {
-                    user.IsSteam = true;
-                    user.SteamCleanId = key[1..];
+                    user.SteamCleanId = steamKey[1..];
                     user.IsDangerous = _options.FlaggedSteamIds.Contains(steamId);
                     user.SteamImgUri = await _avatars.GetAvatarUrlAsync(steamId, cancellationToken);
                 }
                 else
                 {
-                    _logger.LogDebug("Ignoring user key {UserKey}: not a parsable Steam ID.", key);
-                }
-
-                // Checked for every user rather than only Steam users — a lobby hosted from GOG
-                // previously ended up with no host recorded at all.
-                if (user.Id is not null && user.Id == lobby.Owner)
-                {
-                    lobby.Host = user;
+                    _logger.LogDebug(
+                        "Steam-authenticated user {UserKey} did not contain a parsable Steam ID.",
+                        steamKey);
                 }
             }
-        }
-
-        /// <summary>
-        /// Lobby names arrive as "&lt;mod&gt;~~&lt;name&gt;"; this returns the part after the separator.
-        /// </summary>
-        private static string? StripModPrefix(string? name)
-        {
-            if (string.IsNullOrEmpty(name))
-            {
-                return name;
-            }
-
-            var separator = name.IndexOf(ModNameSeparator, StringComparison.Ordinal);
-
-            // This was previously an unguarded IndexOf(...) + 2, so a name with no separator had
-            // its first character sliced off (-1 + 2 == 1).
-            return separator < 0 ? name : name[(separator + ModNameSeparator.Length)..];
         }
 
         private static void SendAuthorization(IWebsocketClient client)
